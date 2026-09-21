@@ -23,6 +23,23 @@ I use these names in the database so nothing gets mixed up:
 
 ---
 
+## 0b. What changed in this revision (fleet by admin/staff + location availability)
+
+You asked for two things that the previous version did not cover. Both are now built into the schema, the API, the rules and the screens.
+
+| # | Gap in the earlier version | Fixed by |
+|---|---|---|
+| 1 | Vehicles could only be created by a **partner** (`POST /partners/vehicles`). Admin and staff had no way to add a cab. | New `fleet` module + `POST /fleet/vehicles`. `vehicles.ownerType` is now `"platform"` (admin-owned) or `"partner"`. Permission rows added in §2. |
+| 2 | `vehicles` had **no photo field** at all (only `drivers.photoUrl` existed). | `vehicles.photo { storagePath, url, thumbUrl, width, height, uploadedBy, uploadedAt }` — exactly one photo per vehicle, enforced server-side. §4.2 and §4.2.1. |
+| 3 | No concept of **where a cab is available**. `partners.serviceAreas` only said which cities a *partner* serves, not which vehicle sits where. | `vehicles.location` (base city + geo + geohash) and `vehicles.serviceCityIds[]`, plus the `cityFleet/{cityId}` rollup for the customer dashboard. |
+| 4 | Customer dashboard had no "cabs available in this city" view; Carlist showed only static `vehicleCategories`. | `cityFleet/{cityId}` read in §5, availability badge and photo on the Carlist/Dashboard cards. |
+| 5 | `vehicleSnapshot` on a booking had no photo, so the customer could not see the car they were sent. | `vehicleSnapshot` now carries `photoUrl`. |
+| 6 | §4.7 said `drivers ──N:1── vehicles`, which is backwards. | A partner/platform owns vehicles; a driver is *assigned* a vehicle. Corrected. |
+| 7 | §4.4 pointed at "counter (see 4.7)"; counters are in §4.6. | Reference corrected. |
+| 8 | No Storage rules for the new image uploads. | §11.1 added. |
+
+---
+
 ## 1. System overview
 
 ```
@@ -56,13 +73,24 @@ Store the role in **Firebase Auth custom claims** (`{ role: "staff", perms: [...
 | View own bookings/wallet | ✅ | – | – | – |
 | View all bookings | ❌ | ✅ (region or assigned scope) | ✅ | ❌ |
 | Assign partner/driver | ❌ | ✅ | ✅ | ❌ |
+| **Add / edit a vehicle + upload its photo** | ❌ | ✅ (`manage_fleet`) | ✅ | ✅ (own vehicles only) |
+| **Publish a vehicle to the customer dashboard** | ❌ | ✅ (`publish_vehicle`) | ✅ | ❌ (partner submits, staff approves) |
+| **Set vehicle location / service cities** | ❌ | ✅ | ✅ | ✅ (own, within approved `serviceAreas`) |
+| **Mark vehicle available / unavailable today** | ❌ | ✅ | ✅ | ✅ (own) |
+| Delete a vehicle (soft) | ❌ | ❌ | ✅ | ❌ |
 | Accept/reject offered trip | ❌ | ❌ | ❌ | ✅ (own offers) |
 | Change fares/markup/rules | ❌ | ❌ | ✅ | ❌ |
 | See customer phone/address | own | ✅ | ✅ | **Only after accept**, masked before |
 | Payouts and settlements | ❌ | view | ✅ | own |
 | Manage staff | ❌ | ❌ | ✅ | ❌ |
 
-`staff.permissions[]` allows fine control (for example `can_cancel`, `can_refund`, `can_edit_fare`, `can_view_finance`).
+`staff.permissions[]` allows fine control (for example `can_cancel`, `can_refund`, `can_edit_fare`, `can_view_finance`, `manage_fleet`, `publish_vehicle`).
+
+**Who owns a cab.** A vehicle now has an `ownerType`:
+- `"platform"` — added by admin or staff. Your own fleet, or a car you list on behalf of a small owner who does not use the portal. Visible to customers as soon as staff publish it.
+- `"partner"` — added by a partner in their portal. It stays `pending_review` until admin or staff approve it, so nobody can push an unverified car onto the customer dashboard.
+
+Both kinds live in the same `vehicles` collection, so search, availability and dispatch treat them identically.
 
 ---
 
@@ -130,7 +158,8 @@ Firestore is NoSQL. The design below uses **top-level collections** for things q
   uid, employeeCode, adminUid,
   department: "dispatch" | "support" | "finance" | "sales",
   designation,
-  permissions: ["assign_driver","cancel_booking","refund","view_finance","edit_fare"],
+  permissions: ["assign_driver","cancel_booking","refund","view_finance","edit_fare",
+                "manage_fleet","publish_vehicle"],   // fleet = add/edit vehicle + photo + availability
   regions: ["BLR","MYS"],          // cities/zones they handle; used to route bookings
   shift: { days: [1,2,3,4,5], start: "09:00", end: "18:00" },
   isOnDuty: true,
@@ -183,19 +212,128 @@ A **single driver** is a partner with `type: "driver"` and one linked driver/veh
 }
 ```
 
-#### `vehicles/{vehicleId}`
+#### `vehicles/{vehicleId}` — added by admin, staff **or** partner
 ```js
 {
-  vehicleId, partnerId,
-  registrationNo, categoryId,     // → vehicleCategories
+  vehicleId,
+
+  // ---- WHO OWNS AND WHO ADDED IT ----
+  ownerType: "platform" | "partner",   // "platform" = added by admin/staff
+  partnerId: null,                     // null when ownerType = "platform"
+  ownerName,                           // display label for admin lists
+  addedBy: { uid, role: "admin"|"staff"|"partner", at: Timestamp },
+  updatedBy: { uid, role, at },
+
+  // ---- IDENTITY ----
+  registrationNo,                      // stored UPPERCASE, no spaces: "KA01AB1234". Unique.
+  categoryId,                          // → vehicleCategories ("hatch"|"sedan"|"muv"|"suv")
   make, model, year, color,
   fuel: "diesel" | "petrol" | "cng" | "ev",
   seats, bags,
-  docs: { insuranceExpiry, permitExpiry, fitnessExpiry, pucExpiry },
-  status: "active" | "maintenance" | "inactive",
-  createdAt
+  features: ["ac","carrier","gps","child_seat"],
+
+  // ---- ONE PHOTO OF THE VEHICLE (required before publishing) ----
+  photo: {
+    storagePath: "vehicles/{vehicleId}/photo.webp",  // private Storage path
+    url,                                             // CDN/download URL, 1200px long edge
+    thumbUrl,                                        // 320px, used in lists and Carlist cards
+    width, height, sizeBytes,
+    uploadedBy: { uid, role },
+    uploadedAt
+  },
+  // Exactly one photo. Re-uploading overwrites the same path and bumps `photoVersion`,
+  // so no orphan files build up in Storage and the CDN URL can be cache-busted.
+  photoVersion: 1,
+
+  // ---- LOCATION: where this cab actually is ----
+  location: {
+    cityId: "BLR",                     // → cities. Base city, the one used for availability
+    cityName: "Bangalore",
+    hubName: "Indiranagar Hub",        // optional: garage / stand / office
+    address,
+    geo: GeoPoint,                     // base point, for "nearest cab" ranking
+    geohash                            // for radius queries (geofirestore-style)
+  },
+  serviceCityIds: ["BLR","MYS"],       // array-contains query: which cities can book this cab
+  outstationAllowed: true,
+
+  // ---- AVAILABILITY (what the customer dashboard reads) ----
+  availability: {
+    isPublished: true,                 // staff/admin toggle: show on customer dashboard
+    isAvailable: true,                 // free right now
+    reason: null,                      // "on_trip" | "maintenance" | "document_expired" | "off_duty"
+    currentBookingId: null,
+    nextFreeAt: null,                  // Timestamp, when it comes back from a trip
+    blockedDates: [ { from, to, reason } ]   // staff can block a car for servicing
+  },
+
+  // ---- DRIVER LINK ----
+  defaultDriverId: null,               // a driver is *assigned* to a vehicle, not the other way round
+
+  // ---- COMPLIANCE ----
+  docs: {
+    rcNumber, rcStoragePath,
+    insuranceExpiry, insuranceStoragePath,
+    permitExpiry, fitnessExpiry, pucExpiry
+  },
+  docsValid: true,                     // set false by a scheduled job when any date passes
+
+  // ---- MODERATION ----
+  status: "draft" | "pending_review" | "active" | "maintenance" | "inactive" | "rejected",
+  reviewedBy: { uid, at }, rejectReason: null,
+
+  stats: { totalTrips: 0, totalKm: 0, lastTripAt: null },
+  isDeleted: false,                    // soft delete only
+  createdAt, updatedAt
 }
 ```
+
+**Server-side rules for this collection**
+1. Only `admin`, `staff` with `manage_fleet`, or the owning `partner` may write — and every write goes through Express, never the client SDK.
+2. `registrationNo` must be unique. Enforce with a `vehicleRegistry/{registrationNo}` doc written in the same transaction (Firestore has no unique index).
+3. A vehicle cannot move to `active` / `isPublished: true` without a photo, a `categoryId`, a `location.cityId` and non-expired insurance.
+4. A partner may only set `serviceCityIds` that exist inside their own `partners.serviceAreas`.
+5. `availability.isAvailable` is flipped automatically by the booking state machine (`driver_assigned` → false, `completed` → true). Staff can override manually; the override is written to `auditLogs`.
+
+#### `vehiclePhotos` — how the upload actually works
+
+One photo, one path, no client writes to the database:
+
+```
+1. Admin/staff/partner picks a file in the "Add Vehicle" form.
+2. Client → POST /fleet/vehicles/:id/photo/upload-url
+   Express validates role + ownership, then returns a *signed* Storage upload URL
+   (v4, PUT, 5 min expiry, content-type image/jpeg|png|webp, max 5 MB).
+3. Client PUTs the file straight to Storage. The API never proxies the bytes.
+4. Storage finalize trigger (Cloud Function) → resize to 1200px + 320px WebP,
+   strip EXIF/GPS, then write `vehicles/{id}.photo` and bump `photoVersion`.
+5. If the resize fails, the vehicle stays unpublished and the staff member sees the error.
+```
+Reject files over 5 MB, non-image MIME types and images under 400px wide. Strip EXIF — phone photos of a car carry the garage's GPS coordinates and the uploader's device id.
+
+#### `cityFleet/{cityId}` — the rollup the customer dashboard reads
+
+Do **not** let the customer dashboard query the whole `vehicles` collection to count cabs. One small document per city, maintained by a Cloud Function on `vehicles` write:
+
+```js
+{
+  cityId: "BLR", cityName: "Bangalore",
+  totalPublished: 48,
+  byCategory: {
+    hatch: { total: 12, available: 7,  minPriceFrom: 1899, sampleVehicleIds: ["v1","v2"] },
+    sedan: { total: 20, available: 11, minPriceFrom: 2499, sampleVehicleIds: [] },
+    muv:   { total: 10, available: 4,  minPriceFrom: 3299, sampleVehicleIds: [] },
+    suv:   { total:  6, available: 2,  minPriceFrom: 3899, sampleVehicleIds: [] }
+  },
+  featured: [                              // what the dashboard card strip shows
+    { vehicleId, model: "Dzire", categoryId: "sedan", thumbUrl, seats: 4, bags: 2, fuel: "cng" }
+  ],
+  updatedAt
+}
+```
+This is one read for "cabs available in Bangalore", instead of a scan. Cap `featured` at about 8 entries and refresh it on a schedule rather than on every write, or a busy city will hit the 1-write-per-second-per-document limit.
+
+> **Honesty check on "available".** A count from `cityFleet` is a *catalogue* number, not a live promise. If you show "7 sedans available" and the customer books one for next Tuesday, availability then is a different question. Show it as "Sedans in Bangalore · from ₹2,499" and only claim real-time availability once dispatch actually holds a vehicle for the booking.
 
 ### 4.3 Catalogue and pricing (admin-managed, cached heavily)
 
@@ -252,7 +390,7 @@ The `zeroCashBufferPercent: 20`, `25%` minimum and `48h` values come straight fr
 ### 4.4 Bookings (core collection)
 
 #### `bookings/{bookingId}`
-`bookingId` is a readable ID such as `AC-260921-00123`, generated from a counter (see 4.7).
+`bookingId` is a readable ID such as `AC-260921-00123`, generated from a counter (see 4.6).
 
 ```js
 {
@@ -318,7 +456,7 @@ The `zeroCashBufferPercent: 20`, `25%` minimum and `48h` values come straight fr
     handledByStaffId,
     partnerId, partnerName,
     driverId, driverSnapshot: { name, phone, photoUrl },
-    vehicleId, vehicleSnapshot: { registrationNo, model, color },
+    vehicleId, vehicleSnapshot: { registrationNo, model, color, photoUrl },   // photo so the customer can identify the car
     assignedAt, assignedBy,
     mode: "manual" | "auto" | "broadcast"
   },
@@ -446,7 +584,10 @@ This supports the "GST invoices" promised in your Register benefits.
 
 ```
 users ──1:1── customers | staff | admins | partners
-partners ──1:N── drivers ──N:1── vehicles
+partners ──1:N── drivers
+vehicles ──N:1── owner   (partners/{id}  OR  platform, i.e. added by admin/staff)
+drivers  ──N:1── vehicles (a driver is assigned a vehicle; defaultDriverId is the usual pairing)
+vehicles ──N:1── cities (location.cityId) ──rollup──> cityFleet/{cityId} → customer dashboard
 customers ──1:N── bookings ──1:N── timeline / notes / messages
 bookings ──1:N── dispatchOffers ──N:1── partners
 bookings ──1:N── payments ; bookings ──1:1── invoice
@@ -468,6 +609,11 @@ vehicleCategories + fareRules + cities → pricing → bookings.fare (snapshot)
 | payments | `bookingId` ↑, `createdAt` ↓ | Payment history |
 | walletTransactions | `walletId` ↑, `createdAt` ↓ | Wallet statement |
 | partners | `status` ↑, `serviceAreas.cityId` (array-contains) | Find partners for a city |
+| vehicles | `serviceCityIds` (array-contains), `availability.isPublished` ↑, `categoryId` ↑ | Customer: cabs available in a city |
+| vehicles | `location.cityId` ↑, `availability.isAvailable` ↑, `categoryId` ↑ | Dispatch: free cars in this city |
+| vehicles | `ownerType` ↑, `status` ↑, `createdAt` ↓ | Admin fleet list (platform vs partner) |
+| vehicles | `partnerId` ↑, `status` ↑ | Partner "my vehicles" |
+| vehicles | `docsValid` ↑, `docs.insuranceExpiry` ↑ | Expiry alerts job |
 
 ---
 
@@ -478,11 +624,14 @@ vehicleCategories + fareRules + cities → pricing → bookings.fare (snapshot)
 | **LandingPage** | `settings/global`, cached stats | – |
 | **Login** | Firebase Auth → `users`, custom claims | `users.lastLoginAt` |
 | **Register** | – | `users` + `customers` (+ `organization`), OTP verify, `wallets` |
-| **MainPage/Dashboard** (One Way, Round Trip, Local, Airport tabs) | `cities`, `airports`, `wallets`, last `bookings` | `quotes` (optional) |
-| **Carlist** (filters: type, fuel, sort; tabs: Inclusions/Exclusions/Facilities/T&C) | `vehicleCategories`, `fareRules` → computed price | – |
+| **MainPage/Dashboard** (One Way, Round Trip, Local, Airport tabs) | `cities`, `airports`, `wallets`, last `bookings`, **`cityFleet/{cityId}`** (cabs available in the selected city, with photo thumbnails and "from ₹" price) | `quotes` (optional) |
+| **Carlist** (filters: type, fuel, sort; tabs: Inclusions/Exclusions/Facilities/T&C) | `vehicleCategories`, `fareRules` → computed price, **`vehicles` filtered by `serviceCityIds` + `isPublished`** for the real photo and count per category | – |
+| **Admin/Staff → Fleet** (new) | `vehicles`, `cities`, `vehicleCategories`, `partners` | `vehicles` (create/edit), vehicle photo upload, `availability`, publish/unpublish — all via `/fleet/*` |
 | **PaymentProcess step 1** (pickup details) | – | `bookings` (status `draft`) |
 | **PaymentProcess step 2** (partial vs zero-cash, coupon, wallet/card/UPI) | `settings/global`, `coupons` | `payments`, `walletTransactions`, `bookings.paymentPlan` |
 | **Dashboard menu:** My Account, Reports, Wallet, Markup Settings, Feedback | `customers`, `bookings`, `wallets`, `feedback` | `customers.markup`, `feedback` |
+
+**Photos on the customer side.** Carlist currently draws `CarArt` SVGs per category. Keep those as the fallback, and show `vehicles.photo.thumbUrl` when a published vehicle exists for that category in the searched city. So the card shows the actual car with its "Available in Bangalore · 7 cars" badge, and falls back to the SVG when a category has no photo yet. Never show `registrationNo` or the driver's phone on this screen — those are released only after booking and assignment.
 
 The car prices on Carlist (₹18,877, "Save ₹2,837") must be computed by the server from `fareRules`, and the client must never send the price. Otherwise anyone can change the fare in the browser and pay less.
 
@@ -503,7 +652,9 @@ server/
       payments/      createOrder, verify, webhook, refund
       wallet/        topup, ledger, hold/release
       dispatch/      offerToPartner, accept, reject, autoAssign, reassign
-      partners/      onboarding, drivers, vehicles, availability
+      fleet/         vehicles CRUD (admin/staff/partner), photoUpload.js (signed URLs),
+                     availability.js, publish.js, cityFleet.js (rollup rebuild)
+      partners/      onboarding, drivers, availability
       staff/         CRUD, workload, followUps
       admin/         reports, pricing rules, payouts, settings
       notifications/ push, sms, whatsapp, email
@@ -523,8 +674,28 @@ POST /dispatch/:bookingId/offer        POST /dispatch/offers/:id/accept | reject
 POST /dispatch/:bookingId/assign       (staff picks partner + driver + vehicle)
 GET  /staff/followups                  POST /staff/followups/:id/complete
 GET  /admin/reports/revenue            PUT  /admin/fare-rules/:id
-POST /partners/drivers                 POST /partners/vehicles      PUT /partners/availability
+POST /partners/drivers                 PUT  /partners/availability
 ```
+
+### Fleet endpoints (admin, staff and partner all use these)
+```
+POST   /fleet/vehicles                        create a vehicle   (admin | staff:manage_fleet | partner)
+GET    /fleet/vehicles?cityId=&category=&ownerType=&status=&cursor=
+GET    /fleet/vehicles/:id                    PATCH /fleet/vehicles/:id
+POST   /fleet/vehicles/:id/photo/upload-url   → signed Storage URL (5 min, 5 MB, image/*)
+POST   /fleet/vehicles/:id/photo/confirm      finalize, resize, strip EXIF, set photo{}
+DELETE /fleet/vehicles/:id/photo              admin/staff only; unpublishes the vehicle
+PUT    /fleet/vehicles/:id/location           { cityId, hubName, address, geo, serviceCityIds[] }
+PUT    /fleet/vehicles/:id/availability       { isAvailable, reason, nextFreeAt, blockedDates[] }
+POST   /fleet/vehicles/:id/publish            staff:publish_vehicle | admin  → visible to customers
+POST   /fleet/vehicles/:id/unpublish          POST /fleet/vehicles/:id/reject  { reason }
+DELETE /fleet/vehicles/:id                    admin only, soft delete
+POST   /fleet/vehicles/:id/assign-driver      { driverId }   sets defaultDriverId
+
+GET    /catalog/availability?cityId=BLR       public → cityFleet/{cityId} (cached 60 s)
+```
+
+**Validation on `POST /fleet/vehicles` (zod):** `registrationNo` matches the Indian RC pattern and is unique; `categoryId` exists in `vehicleCategories`; `location.cityId` exists in `cities`; `seats` between 2 and 26; insurance expiry in the future; `partnerId` required when `ownerType = "partner"` and forbidden when `"platform"`. A staff member cannot set `ownerType` to a partner they do not have scope over.
 
 ---
 
@@ -561,6 +732,7 @@ Recommendations:
 2. Customer CRM: all customer data, tags, lifetime value, assigned staff.
 3. Staff management: create, roles and permissions, workload, shifts.
 4. Partner management: KYC approval, service areas, ratings, block or unblock.
+4b. **Fleet management (new).** Vehicle list with photo thumbnails, filters by city, category, owner type and status. "Add Vehicle" form: registration, make/model/year/colour, fuel, seats/bags, category, **one photo upload with live preview and crop**, base city + hub + map pin, service cities (multi-select), documents with expiry dates. Bulk CSV import for a large fleet, with photos uploaded afterwards. Approve or reject partner-submitted vehicles. Expiry dashboard: insurance/permit/fitness/PUC due in the next 30 days.
 5. Pricing: fare rules, city-pair overrides, coupons, commission plans.
 6. Finance: payments, refunds, wallet ledger, payouts, GST invoices.
 7. Reports: bookings, revenue, cancellations, partner performance, staff performance. Export CSV.
@@ -572,6 +744,7 @@ Recommendations:
 3. Follow-up tasks with auto-created reminders (e.g. 2 h before pickup: confirm driver; driver late: call).
 4. Call/notes log on each booking, with timeline.
 5. Create a booking on behalf of a customer (phone orders).
+6. **Fleet desk (new):** add a vehicle with its photo, set its base city and service cities, toggle availability, block a car for servicing, and publish it to the customer dashboard (if `publish_vehicle` is granted). Staff only see vehicles in their `regions[]`.
 
 **Partner portal (mobile-first PWA)**
 1. Offers inbox with countdown timer, accept or reject.
@@ -587,8 +760,8 @@ Recommendations:
 |---|---|---|
 | **0. Foundation** | 1–2 | Firebase project (dev/stage/prod), Express skeleton on Cloud Run, CI/CD, Firebase Auth with custom claims, Security Rules v1, env and secrets management |
 | **1. Customer MVP** | 3–6 | Real Register/Login/OTP, city search, `fareEngine`, Carlist from DB, booking draft, Razorpay payment (both plans), booking confirmation, My Bookings, wallet basic |
-| **2. Admin and Staff** | 7–10 | Admin panel, dispatch board, manual assignment, follow-ups, timeline, notes, customer CRM, notifications (SMS/WhatsApp/push) |
-| **3. Partners** | 11–14 | Partner onboarding and KYC, offers and accept flow, driver/vehicle management, partner PWA, trip start OTP, live tracking, extras, duty slip |
+| **2. Admin and Staff** | 7–10 | Admin panel, **fleet management (add vehicle + photo + location + availability, publish to customer dashboard, `cityFleet` rollup)**, dispatch board, manual assignment, follow-ups, timeline, notes, customer CRM, notifications (SMS/WhatsApp/push) |
+| **3. Partners** | 11–14 | Partner onboarding and KYC, offers and accept flow, driver management, partner vehicle submission reusing the Phase-2 `/fleet/*` API with `ownerType: "partner"` and staff approval, partner PWA, trip start OTP, live tracking, extras, duty slip |
 | **4. Finance and reports** | 15–17 | Payouts, GST invoices, refunds/cancellation policy engine, reports and exports, audit log |
 | **5. Scale and polish** | 18+ | Auto-dispatch, dynamic pricing, ratings, coupons, referral, analytics in BigQuery, load tests, security review |
 
@@ -605,7 +778,8 @@ Ship Phases 0–2 with a **manual dispatch process** first, since one small ops 
 4. **Denormalize for reads.** The snapshots inside `bookings` (customer, driver, vehicle) mean a list needs one query and no joins. Update snapshots by Cloud Function only when the change matters.
 5. **Aggregate counters**, not scans. Dashboard numbers (like the "Bookings" stat in your MainPage tabs) come from `stats` docs or `daily_stats/{date}`, updated by triggers. Firestore `count()` aggregation is fine for small ones.
 6. **Live GPS in Realtime Database**, throttled (every 5–10 s, only while a trip is active).
-7. **Image and asset optimization.** Serve car images in WebP through a CDN with lazy loading. Your `CarArt` SVGs are already light; keep them for the default.
+7. **Image and asset optimization.** Serve car images in WebP through a CDN with lazy loading. Your `CarArt` SVGs are already light; keep them as the fallback when a category has no vehicle photo. For uploaded vehicle photos, generate the 320px thumbnail once at upload time and use it everywhere in lists — never let the browser download a 1200px photo to render a 90px card. Set `Cache-Control: public, max-age=31536000, immutable` and cache-bust with `?v={photoVersion}`.
+7b. **Never render the availability count from a live query.** `cityFleet/{cityId}` is one document read, cached 60 seconds in Express. Counting published vehicles per category on every dashboard load is the fastest way to a large Firestore bill.
 8. **Frontend:** code-split by role and route, memoize list rows, virtualize long tables (`react-window`) for the admin panel.
 9. **Avoid hot documents.** Firestore handles about 1 write/sec per document. Use sharded counters for `counters` if booking volume grows.
 10. **Background jobs** (offer expiry, reminders, invoice PDFs, payouts) belong in **Cloud Tasks / Scheduler**, not inside request handlers.
@@ -663,6 +837,16 @@ service cloud.firestore {
     match /dispatchOffers/{id} { allow read: if signedIn() && (isStaff() || resource.data.partnerId == request.auth.token.partnerId); allow write: if false; }
     match /vehicleCategories/{id} { allow read: if true; allow write: if false; }
     match /cities/{id}            { allow read: if true; allow write: if false; }
+    match /cityFleet/{cityId}     { allow read: if true; allow write: if false; }   // customer dashboard availability
+    match /vehicles/{id} {
+      // customers see only published, active, non-deleted cars; staff/partner see their own fully
+      allow read: if (resource.data.availability.isPublished == true
+                      && resource.data.status == 'active'
+                      && resource.data.isDeleted == false)
+                   || isStaff()
+                   || (signedIn() && resource.data.partnerId == request.auth.token.partnerId);
+      allow write: if false;                       // all writes via /fleet/* on Express
+    }
     match /fareRules/{id}         { allow read: if isStaff(); allow write: if false; }   // customers get computed prices only
     match /wallets/{id}           { allow read: if signedIn() && resource.data.ownerUid == request.auth.uid; allow write: if false; }
     match /{document=**}          { allow read, write: if false; }
@@ -670,6 +854,29 @@ service cloud.firestore {
 }
 ```
 Because the Express server uses the Admin SDK, it bypasses these rules. That is why the rules can be strict, and why the API must check role and ownership itself on every route.
+
+A caveat on the `vehicles` read rule: Firestore evaluates rules per document, so a client query must carry the same filters (`where('availability.isPublished','==',true).where('status','==','active')`) or it fails with a permissions error rather than silently filtering. For the customer dashboard, prefer reading `cityFleet/{cityId}` and only query `vehicles` on the Carlist screen where those filters are set anyway.
+
+### 11.1 Storage rules (vehicle photos and documents)
+
+```js
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Vehicle photos: world-readable (they appear on the public Carlist),
+    // but written only by the server via signed URLs / Admin SDK.
+    match /vehicles/{vehicleId}/{file} {
+      allow read: if true;
+      allow write: if false;
+    }
+    // KYC, RC, insurance, licences: never public. Served as short-lived signed URLs.
+    match /kyc/{allPaths=**}       { allow read, write: if false; }
+    match /vehicleDocs/{allPaths=**} { allow read, write: if false; }
+    match /invoices/{allPaths=**}  { allow read, write: if false; }
+  }
+}
+```
+The signed upload URL issued by `/fleet/vehicles/:id/photo/upload-url` bypasses these rules, which is the point: the only way a file reaches Storage is through a request Express has already authorised. Set a Storage lifecycle rule to delete `vehicles/*/tmp/*` after 24 hours so abandoned uploads do not accumulate.
 
 ---
 
@@ -680,3 +887,6 @@ Because the Express server uses the Admin SDK, it bypasses these rules. That is 
 3. **Multi-tenant / white-label** needed? If yes, add `tenantId` now.
 4. **Payments:** Razorpay only? Is a credit (postpaid) limit needed for agencies?
 5. **Booking on behalf:** should staff be able to create bookings for phone customers? (Supported via `createdBy`.)
+6. **Vehicle photos on the customer side:** should the customer see the *actual* car photo added by staff, or only the category image? Showing a real photo raises expectations — if the car that turns up is a different Dzire, you get complaints. My default: real photo on the Carlist card with "or similar" under it, and the exact car's photo only after assignment.
+7. **Availability semantics:** is the dashboard number a catalogue count ("we run 20 sedans in Bangalore") or a live free-now count? Live counts need vehicle-level holds during booking; catalogue counts do not. Phase 2 ships the catalogue count unless you say otherwise.
+8. **Who publishes:** can staff publish a vehicle to customers directly, or must admin approve every car? I made it a staff permission (`publish_vehicle`) so you can grant it selectively.
